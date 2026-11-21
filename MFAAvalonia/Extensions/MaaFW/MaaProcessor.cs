@@ -701,6 +701,21 @@ public class MaaProcessor
                         taskerStopped = false;
                         LoggerHelper.Warning($"停止 MaaTasker 内部任务失败：{stopTask.Exception?.GetBaseException().Message}");
                     }
+                    else
+                    {
+                        // 停止成功后释放旧 Tasker 持有的原生资源（DisposeOptions.All = Resource + Controller）。
+                        // 仅 Stop() 不 Dispose() 会导致每次「切换实例」遗留一整套 native 资源
+                        //（OCR 模型 + ONNX Runtime 内存池），内存持续增长直至崩溃。
+                        // Dispose 放在 Stop 完成之后，避免任务运行中释放导致 handle is null。
+                        try
+                        {
+                            oldTasker.Dispose();
+                        }
+                        catch (Exception e)
+                        {
+                            LoggerHelper.Warning($"释放旧 MaaTasker 失败：{e.Message}");
+                        }
+                    }
                 }
                 catch (Exception e)
                 {
@@ -740,7 +755,7 @@ public class MaaProcessor
             _screenshotTaskerInitTask = null;
 
             // Publish the new generation and drop the old job under the same job
-            // lock used by PostScreencapPipelined to prevent republishing a stale job.
+            // lock used by PumpLiveViewFrame to prevent republishing a stale job.
             lock (_liveViewScreencapJobLock)
             {
                 _liveViewScreencapJob = null;
@@ -1043,9 +1058,9 @@ public class MaaProcessor
             }
 
             LoggerHelper.Info("ADB 设备配置在连接期间发生变化，释放过期连接并重新初始化。");
+            // SetTasker() 内部会在 Stop 成功后 Dispose 旧 Tasker，无需在此重复释放。
             SetTasker(tuple.Item1);
             SetTasker();
-            tuple.Item1.Dispose();
         }
 
         return (null, false, true);
@@ -1110,7 +1125,7 @@ public class MaaProcessor
         {
             // Detaching increments the generation and clears the in-flight job.
             // Doing it on every shared-controller lookup makes
-            // PostScreencapPipelined discard every frame as stale.
+            // PumpLiveViewFrame discard every frame as stale.
             if (_screenshotTasker != null || _screenshotTaskerInitTask != null)
                 DisposeScreenshotTasker();
             return MaaTasker;
@@ -1339,20 +1354,33 @@ public class MaaProcessor
     private readonly Lock _liveViewScreencapJobLock = new();
 
     /// <summary>
-    /// 流水线式提交实时视图截图：非阻塞，提交后立即返回，截图由控制器在后台执行。
-    /// 若上一帧截图仍在执行则复用而不重复提交，避免任务堆积。
-    /// 相比原 PostScreencap 的同步 Screencap().Wait()，定时器不再被截图耗时阻塞，
-    /// 实时视图刷新率可真正由 LiveViewRefreshRate 决定。
+    /// 实时视图流水线单次泵送结果。
     /// </summary>
-    /// <returns>null 表示控制器不可用或截图任务器已切换；Succeeded 表示已提交或仍有正常在途截图；
-    /// Failed/Invalid 表示上一帧截图失败（与 PostScreencap 的失败语义一致）。</returns>
-    public MaaJobStatus? PostScreencapPipelined()
+    public readonly struct LiveViewPumpResult
+    {
+        /// <summary>上一帧已完成的截图（调用方负责 Dispose）。</summary>
+        public MaaImageBuffer? Frame { get; init; }
+
+        /// <summary>仅当上一帧截图失败时为 Failed/Invalid，否则为 null。</summary>
+        public MaaJobStatus? Failure { get; init; }
+
+        /// <summary>上一帧截图成功但读缓存为空（异常，如截图方式不兼容/画面空）。</summary>
+        public bool NoImage { get; init; }
+    }
+
+    /// <summary>
+    /// 流水线式泵送实时视图截图：非阻塞，提交后立即返回，截图由控制器在后台执行。
+    /// 关键：仅在上一帧截图完成之后、提交下一帧之前读取缓存，避免 Screencap 与 GetCachedImage
+    /// 并发读写 native 缓冲区（横竖屏旋转触发缓冲区重分配时会导致 use-after-free 崩溃）。
+    /// </summary>
+    /// <returns>Frame 为上一帧已完成的截图；Failure 为失败终态（Failed/Invalid）；NoImage 为截图成功但缓存为空。</returns>
+    public LiveViewPumpResult PumpLiveViewFrame()
     {
         var screenshotTaskerGeneration = Volatile.Read(ref _screenshotTaskerGeneration);
         var controller = GetScreenshotController(false);
         if (controller == null)
         {
-            return null;
+            return default;
         }
 
         if (!controller.IsConnected)
@@ -1360,12 +1388,15 @@ public class MaaProcessor
             if (screenshotTaskerGeneration != Volatile.Read(ref _screenshotTaskerGeneration))
             {
                 // The tasker was detached while resolving its controller.
-                return null;
+                return default;
             }
 
-            return IsAnyScreenshotRelatedWorkRunning(controller)
-                ? MaaJobStatus.Succeeded
-                : MaaJobStatus.Invalid;
+            if (IsAnyScreenshotRelatedWorkRunning(controller))
+            {
+                return default;
+            }
+
+            return new LiveViewPumpResult { Failure = MaaJobStatus.Invalid };
         }
 
         lock (_liveViewScreencapJobLock)
@@ -1373,7 +1404,7 @@ public class MaaProcessor
             if (screenshotTaskerGeneration != Volatile.Read(ref _screenshotTaskerGeneration))
             {
                 // The tasker was detached while resolving its controller.
-                return null;
+                return default;
             }
 
             var job = _liveViewScreencapJob;
@@ -1388,39 +1419,59 @@ public class MaaProcessor
                 {
                     // 任务器已重建，放弃旧的在途任务
                     _liveViewScreencapJob = null;
-                    return MaaJobStatus.Invalid;
+                    return new LiveViewPumpResult { Failure = MaaJobStatus.Invalid };
                 }
                 catch
                 {
                     _liveViewScreencapJob = null;
-                    return MaaJobStatus.Invalid;
+                    return new LiveViewPumpResult { Failure = MaaJobStatus.Invalid };
                 }
 
                 if (status.IsRunning() || status.IsPending())
                 {
-                    // 上一帧仍在执行，保持流水线复用，不重复提交
-                    return MaaJobStatus.Succeeded;
+                    // 上一帧仍在执行，保持流水线复用，不重复提交，也不读缓存
+                    return default;
                 }
 
                 // 上一帧已结束：若失败，先向调用方上报（仅一次），随后替换为新的在途任务
                 _liveViewScreencapJob = null;
                 if (status is MaaJobStatus.Failed or MaaJobStatus.Invalid)
                 {
-                    return status;
+                    return new LiveViewPumpResult { Failure = status };
                 }
+
+                // 上一帧已完成，缓存此刻稳定：先读缓存，再提交下一帧，避免并发读写。
+                var frame = GetImage(controller, false);
+                try
+                {
+                    _liveViewScreencapJob = controller.Screencap();
+                }
+                catch (Exception ex)
+                {
+                    LoggerHelper.Warning($"提交截图任务失败：{ex.Message}");
+                    _liveViewScreencapJob = null;
+                    frame?.Dispose();
+                    return new LiveViewPumpResult { Failure = MaaJobStatus.Invalid };
+                }
+
+                return frame == null
+                    ? new LiveViewPumpResult { NoImage = true }
+                    : new LiveViewPumpResult { Frame = frame };
             }
 
+            // 无在途任务（首帧）：提交第一次截图，暂无画面可显示。
             try
             {
                 _liveViewScreencapJob = controller.Screencap();
-                return MaaJobStatus.Succeeded;
             }
             catch (Exception ex)
             {
                 LoggerHelper.Warning($"提交截图任务失败：{ex.Message}");
                 _liveViewScreencapJob = null;
-                return MaaJobStatus.Invalid;
+                return new LiveViewPumpResult { Failure = MaaJobStatus.Invalid };
             }
+
+            return default;
         }
     }
 

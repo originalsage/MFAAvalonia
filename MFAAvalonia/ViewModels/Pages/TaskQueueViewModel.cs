@@ -3640,14 +3640,15 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                 return;
             if (EnableLiveView && IsConnected)
             {
-                // 流水线：非阻塞提交下一帧截图（若上一帧仍在执行则复用，避免任务堆积），
-                // 随后读取最近完成的一帧进行显示。相比原来的同步 Screencap().Wait()，
-                // 定时器不再被截图耗时阻塞，实际刷新率可真正由 LiveViewRefreshRate 决定。
-                // 返回值为上一帧的失败终态（Failed/Invalid）时走既有恢复逻辑（连续失败达阈值才重建/断开）。
-                var status = Processor.PostScreencapPipelined();
-                if (status is MaaJobStatus.Failed or MaaJobStatus.Invalid)
+                // 流水线：非阻塞提交下一帧截图；仅当上一帧已完成时，才在提交下一帧之前读取其缓存。
+                // 读永远发生在截图完成之后、下一帧提交之前，避免 Screencap 与 GetCachedImage
+                // 并发读写 native 缓冲区（横竖屏旋转触发缓冲区重分配时会导致崩溃）。
+                var result = Processor.PumpLiveViewFrame();
+
+                if (result.Failure is MaaJobStatus.Failed or MaaJobStatus.Invalid)
                 {
-                    if (Processor.HandleScreencapStatus(status.Value))
+                    var failStatus = result.Failure.Value;
+                    if (Processor.HandleScreencapStatus(failStatus))
                     {
                         if (Processor.IsMainControllerConnected())
                         {
@@ -3662,31 +3663,25 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                                 AddLogByKey(LangKeys.ScreencapTimeoutDisconnected, Brushes.OrangeRed, changeColor: false);
                             });
                         }
-
-                        return;
                     }
                     return;
                 }
 
-                var buffer = Processor.GetLiveViewBuffer(false);
-                if (buffer == null)
-                {
-                    if (!_liveViewNoImageLogged)
-                    {
-                        _liveViewNoImageLogged = true;
-                        var screencapType = Processor.ScreenshotType();
-                        var controllerType = CurrentController;
-                        var reason = controllerType == MaaControllerTypes.Adb
-                            ? LangKeys.LiveViewNoImageReasonAdb.ToLocalization()
-                            : LangKeys.LiveViewNoImageReasonWindow.ToLocalization();
-                        LoggerHelper.Warning($"实时画面为空：截图方式={screencapType}，控制器={controllerType}，原因={reason}");
-                        AddLog($"warn: {LangKeys.LiveViewNoImageWarning.ToLocalizationFormatted(false, screencapType, reason)}", (IBrush?)null);
-                    }
-                }
-                else
+                if (result.Frame != null)
                 {
                     _liveViewNoImageLogged = false;
-                    _ = UpdateLiveViewImageAsync(buffer);
+                    _ = UpdateLiveViewImageAsync(result.Frame);
+                }
+                else if (result.NoImage && !_liveViewNoImageLogged)
+                {
+                    _liveViewNoImageLogged = true;
+                    var screencapType = Processor.ScreenshotType();
+                    var controllerType = CurrentController;
+                    var reason = controllerType == MaaControllerTypes.Adb
+                        ? LangKeys.LiveViewNoImageReasonAdb.ToLocalization()
+                        : LangKeys.LiveViewNoImageReasonWindow.ToLocalization();
+                    LoggerHelper.Warning($"实时画面为空：截图方式={screencapType}，控制器={controllerType}，原因={reason}");
+                    AddLog($"warn: {LangKeys.LiveViewNoImageWarning.ToLocalizationFormatted(false, screencapType, reason)}", (IBrush?)null);
                 }
             }
             else
