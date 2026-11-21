@@ -361,7 +361,7 @@ jobs:
           prerelease: ${{ contains(needs.meta.outputs.tag, '-') }}
           generate_release_notes: true
         env:
-          TOKEN: ${{ secrets.MFA_TOKEN }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Trigger MirrorChyanUploading
         if: ${{ github.repository_owner == 'MaaXYZ' }}
