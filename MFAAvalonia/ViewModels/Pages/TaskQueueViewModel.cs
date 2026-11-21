@@ -3492,15 +3492,13 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
             }
             if (EnableLiveView && IsConnected)
             {
-                // 流水线：非阻塞提交下一帧截图；仅当上一帧已完成时，才在提交下一帧之前读取其缓存。
-                // 读永远发生在截图完成之后、下一帧提交之前，避免 Screencap 与 GetCachedImage
-                // 并发读写 native 缓冲区（横竖屏旋转触发缓冲区重分配时会导致崩溃）。
-                var result = Processor.PumpLiveViewFrame();
+                // 同步截图：Screencap().Wait() 保证截图与读缓存同一线程、时序串行，
+                // 避免异步流水线跨线程读写 native 缓冲区在分辨率变化时导致的崩溃。
+                var status = Processor.PostScreencap();
 
-                if (result.Failure is MaaJobStatus.Failed or MaaJobStatus.Invalid)
+                if (status is MaaJobStatus.Failed or MaaJobStatus.Invalid)
                 {
-                    var failStatus = result.Failure.Value;
-                    if (Processor.HandleScreencapStatus(failStatus))
+                    if (Processor.HandleScreencapStatus(status))
                     {
                         if (Processor.IsMainControllerConnected())
                         {
@@ -3519,13 +3517,8 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                     return;
                 }
 
-                if (result.Frame != null)
-                {
-                    _liveViewNoImageFailureCount = 0;
-                    _liveViewNoImageLogged = false;
-                    _ = UpdateLiveViewImageAsync(result.Frame);
-                }
-                else if (result.NoImage)
+                var buffer = Processor.GetLiveViewBuffer(false);
+                if (buffer == null)
                 {
                     if (!_liveViewNoImageLogged
                         && ++_liveViewNoImageFailureCount >= LiveViewNoImageFailureThreshold)
@@ -3539,6 +3532,12 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                         LoggerHelper.Warning($"实时画面为空：截图方式={screencapType}，控制器={controllerType}，原因={reason}");
                         AddLog($"warn: {LangKeys.LiveViewNoImageWarning.ToLocalizationFormatted(false, screencapType, reason)}", (IBrush?)null);
                     }
+                }
+                else
+                {
+                    _liveViewNoImageFailureCount = 0;
+                    _liveViewNoImageLogged = false;
+                    _ = UpdateLiveViewImageAsync(buffer);
                 }
             }
             else
