@@ -3784,6 +3784,11 @@ public class MaaProcessor
         if (tasks.Count == 0)
             return tasks;
 
+        // 「切换实例」节点运行时会中断当前队列，自身被标记为 Stopped（而非 Succeeded），
+        // 续跑逻辑会据此误跳过前面已成功的任务。检测到该节点时本轮不做续跑过滤。
+        if (tasks.Any(task => task.InterfaceItem?.Entry == "SwitchInstanceAction"))
+            return tasks;
+
         // 用户可在 游戏设置 中关闭「重新启动队列时从上次未完成的任务继续」
         if (!InstanceConfiguration.GetValue(ConfigurationKeys.ResumeInterruptedQueue, true))
             return tasks;
