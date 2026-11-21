@@ -397,14 +397,19 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
 
         var nameChanged = !string.Equals(NormalizeControllerName(_savedControllerName),
             NormalizeControllerName(value.Name), StringComparison.OrdinalIgnoreCase);
-        _savedControllerName = value.Name;
-        Processor.InstanceConfiguration.SetValue(ConfigurationKeys.CurrentControllerName, value.Name ?? string.Empty);
+        // Before ReadInterface, the default list is only a temporary UI selection.
+        // Keep the saved identity in memory as well as on disk for the real catalogue.
+        if (MaaProcessor.Interface != null)
+        {
+            _savedControllerName = value.Name;
+            Processor.InstanceConfiguration.SetValue(ConfigurationKeys.CurrentControllerName, value.Name ?? string.Empty);
+        }
 
         if (value.ControllerType != CurrentController)
         {
             CurrentController = value.ControllerType;
         }
-        else if (!_isSyncing && nameChanged)
+        else if (!_isSyncing && MaaProcessor.Interface != null && nameChanged)
         {
             // A different named controller can use the same backend with different settings.
             HandleControllerChanged(value.ControllerType);
@@ -416,10 +421,15 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
     /// </summary>
     public string? GetCurrentControllerName()
     {
-        return SelectedController?.Name ?? _savedControllerName ?? TaskLoader.GetControllerName(CurrentController, MaaProcessor.Interface);
+        if (MaaProcessor.Interface == null)
+            return NormalizeControllerName(_savedControllerName) ?? SelectedController?.Name;
+
+        return GetSelectedControllerDefinition(CurrentController)?.Name
+            ?? MaaInterfaceActivationHelper.ResolveControllerDefinition(
+                ControllerOptions, CurrentController, _savedControllerName)?.Name;
     }
 
-    public void UpdateResourcesForController(string? targetResource = null)
+    public void UpdateResourcesForController(string? targetResource = null, bool controllerChanged = false)
     {
         try
         {
@@ -461,7 +471,9 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
 
             DispatcherHelper.RunOnMainThread(() =>
             {
+                var resourceUnchanged = string.Equals(CurrentResource, resolvedResource, StringComparison.Ordinal);
                 _isRefreshingResourceSelection = true;
+                _isChangingControllerResource = controllerChanged;
                 _pendingResourceSelection = resolvedResource;
                 try
                 {
@@ -471,6 +483,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                 finally
                 {
                     _isRefreshingResourceSelection = false;
+                    _isChangingControllerResource = false;
                     _pendingResourceSelection = null;
                 }
 
@@ -478,6 +491,8 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                 {
                     CurrentResource = resolvedResource;
                 }
+                if (controllerChanged && resourceUnchanged)
+                    UpdateTasksForResource(CurrentResource);
             });
         }
         catch (Exception ex)
@@ -666,12 +681,6 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
 
     [ObservableProperty] private ObservableCollection<DragItemViewModel> _taskItemViewModels = [];
 
-    partial void OnTaskItemViewModelsChanged(ObservableCollection<DragItemViewModel> value)
-    {
-        if (ConfigurationManager.IsSwitching) return;
-        Processor.InstanceConfiguration.SetValue(ConfigurationKeys.TaskItems, value.Where(model => !model.IsResourceOptionItem).Select(model => model.InterfaceItem).ToList());
-    }
-
     [RelayCommand]
     private void Toggle()
     {
@@ -684,7 +693,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
     public void StartTask()
     {
         using var _ = BeginUiLogScope("StartTask");
-        LoggerHelper.UserAction("启动任务", $"{DescribeCurrentSelection()}, {DescribeSelectedTasks()}",
+        LoggerHelper.UserAction("启动任务", $"{DescribeCurrentSelection()}, {Processor.DescribeAdbConnectionTarget()}, {DescribeSelectedTasks()}",
             operation: "StartTask", instanceId: Processor.InstanceId, instanceName: InstanceName);
 
         if (IsRunning)
@@ -737,29 +746,31 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
 
         // 验证所有已勾选任务的 input 选项
         var failedTasks = new List<string>();
+        var hasSharedValidationError = false;
         foreach (var task in TaskItemViewModels)
         {
             task.HasValidationError = false;
-            if (!task.IsChecked) continue;
+            if (!task.IsChecked || !task.IsTaskSupported) continue;
 
             var options = task.IsResourceOptionItem
                 ? task.ResourceItem?.SelectOptions
                 : task.InterfaceItem?.Option;
             if (options == null) continue;
 
-            EnsureDefaultOptionValues(options);
+            // 校验读当前取值，没有用户值的项按资源默认校验，不再把默认值写进选项。
             var error = ValidateOptionsRecursive(options);
             if (error != null)
             {
                 task.HasValidationError = true;
-                failedTasks.Add($"{task.Name}: {error}");
+                failedTasks.Add(LangKeys.TaskStartValidationFailure.ToLocalizationFormatted(false, task.Name, error));
+                hasSharedValidationError |= task.IsResourceOptionItem;
             }
         }
 
         if (failedTasks.Count > 0)
         {
-            ToastHelper.Warn(LangKeys.CannotStart.ToLocalization(), string.Join("\n", failedTasks));
-            return;
+            ToastHelper.Warn(LangKeys.Tip.ToLocalization(), string.Join("\n", failedTasks));
+            if (hasSharedValidationError) return;
         }
 
         if (PlatformControllerFactory.CanInitializeWithoutDevice && Processor.MaaTasker?.Controller == null)
@@ -788,45 +799,30 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         Processor.Stop(MFATask.MFATaskStatus.STOPPED, action: action);
     }
 
-    private static string? ValidateOptionsRecursive(IEnumerable<MaaInterface.MaaInterfaceSelectOption> options)
+    private string? ValidateOptionsRecursive(IEnumerable<MaaInterface.MaaInterfaceSelectOption> options)
     {
-        foreach (var selectOption in options)
-        {
-            if (string.IsNullOrEmpty(selectOption.Name)) continue;
-            if (MaaProcessor.Interface?.Option?.TryGetValue(selectOption.Name, out var optDef) != true) continue;
-
-            if (optDef.IsInput)
+        if (MaaProcessor.Interface?.Option == null) return null;
+        var controllerName = GetCurrentControllerName();
+        OptionSelection.ValidateActive(MaaProcessor.Interface.Option, options, out var error,
+            definition => MaaInterfaceActivationHelper.IsOptionApplicable(
+                MaaProcessor.Interface, definition, controllerName, CurrentResource),
+            (definition, selection) =>
             {
-                var result = optDef.ValidateAllInputs(selectOption.Data);
-                if (!result.IsValid) return result.ErrorMessage;
-            }
-
-            if (selectOption.SubOptions is { Count: > 0 } && optDef.Cases != null)
-            {
-                var index = selectOption.Index ?? 0;
-                if (index >= 0 && index < optDef.Cases.Count)
-                {
-                    var selectedCase = optDef.Cases[index];
-                    if (selectedCase.Option is { Count: > 0 })
-                    {
-                        var activeNames = new HashSet<string>(selectedCase.Option);
-                        var subError = ValidateOptionsRecursive(
-                            selectOption.SubOptions.Where(s => activeNames.Contains(s.Name ?? string.Empty)));
-                        if (subError != null) return subError;
-                    }
-                }
-            }
-        }
-        return null;
+                if (!definition.IsInput) return null;
+                var result = definition.ValidateAllInputs(selection.Data);
+                return result.IsValid ? null : result.ErrorMessage;
+            });
+        return error;
     }
 
-    private static void EnsureDefaultOptionValues(IEnumerable<MaaInterface.MaaInterfaceSelectOption>? options)
+    private static void PrepareOptions(IEnumerable<MaaInterface.MaaInterfaceSelectOption>? options,
+        MaaInterface? @interface)
     {
         if (options == null) return;
 
         foreach (var option in options)
         {
-            TaskLoader.SetDefaultOptionValue(MaaProcessor.Interface, option);
+            TaskLoader.PrepareOption(@interface, option);
         }
     }
 
@@ -834,8 +830,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
     private void SelectAll()
     {
         using var _ = BeginUiLogScope("SelectAllTasks");
-        foreach (var task in TaskItemViewModels)
-            task.IsChecked = true;
+        ApplyTaskCheckState(true);
         LoggerHelper.UserAction("全选任务", $"taskCount={TaskItemViewModels.Count}",
             operation: "SelectAllTasks", instanceId: Processor.InstanceId, instanceName: InstanceName);
     }
@@ -844,8 +839,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
     private void SelectNone()
     {
         using var _ = BeginUiLogScope("SelectNoneTasks");
-        foreach (var task in TaskItemViewModels)
-            task.IsChecked = false;
+        ApplyTaskCheckState(false);
         LoggerHelper.UserAction("取消全选任务", $"taskCount={TaskItemViewModels.Count}",
             operation: "SelectNoneTasks", instanceId: Processor.InstanceId, instanceName: InstanceName);
     }
@@ -889,6 +883,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         });
         HasPresets = presets is { Count: > 0 };
         _appliedPresets = presets;
+        OnPropertyChanged(nameof(ResetTasksTip));
     }
 
     [RelayCommand]
@@ -902,6 +897,16 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
             instanceId: Processor.InstanceId,
             instanceName: InstanceName);
 
+        if (TryApplyTaskEdit(BuildPresetCandidate(preset), resetHistory: true, setPreset: true, presetKey: preset.Name))
+            OnPropertyChanged(nameof(ResetTasksTip));
+    }
+
+    /// <summary>
+    /// 按预设的当前版本构造任务队列，应用预设与按预设重置共用。
+    /// 预设没给的选项值不写，读取时跟随当前默认。
+    /// </summary>
+    private List<DragItemViewModel> BuildPresetCandidate(MaaInterface.MaaInterfacePreset preset)
+    {
         // 1. 根据预设中的任务列表重建任务顺序与数量：
         //    - 只保留预设中出现的任务（例如：默认 ABCD，预设只有 AB，则应用后只显示 AB 两个任务）
         //    - 保留全局资源设置项（IsResourceOptionItem）
@@ -918,34 +923,33 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         // 使用 TasksSource 作为模板，保证从 interface 原始定义克隆任务。
         // 这里按名称保留模板源，但应用时必须按预设项出现顺序逐个克隆，
         // 不能再按名称回查，否则同名任务（例如多个“自动出征”）会全部落到第一项上。
-        var templateDict = Processor.TasksSource
+        var templateDict = TaskEditing.Templates()
             .Where(t => !string.IsNullOrEmpty(t.InterfaceItem?.Name))
             .GroupBy(t => t.InterfaceItem!.Name!)
             .ToDictionary(g => g.Key, g => g.First());
 
         var presetTaskBindings = new List<(MaaInterface.MaaInterfacePresetTask PresetTask, DragItemViewModel DragItem)>();
 
-        // 重新构建 TaskItemViewModels
-        TaskItemViewModels.Clear();
+        var candidate = new List<DragItemViewModel>();
 
         // 先恢复资源选项项（保持原有顺序）
         foreach (var item in resourceOptionItems)
-            TaskItemViewModels.Add(item);
+            candidate.Add(item);
 
         // 再按预设顺序添加任务项，并记录“预设项 -> 新克隆任务项”的一一映射
-        foreach (var presetTask in preset.Task.Where(t => !string.IsNullOrEmpty(t.Name)))
+        foreach (var presetTask in (preset.Task ?? []).Where(t => !string.IsNullOrEmpty(t.Name)))
         {
             if (!templateDict.TryGetValue(presetTask.Name!, out var templateVm)) continue;
 
             var cloned = templateVm.Clone();
-            cloned.OwnerViewModel = this;
-            TaskItemViewModels.Add(cloned);
+            cloned.OwnerViewModel = null;
+            candidate.Add(cloned);
             presetTaskBindings.Add((presetTask, cloned));
         }
 
         // 最后把特殊任务放到列表末尾
         foreach (var special in specialTasks)
-            TaskItemViewModels.Add(special);
+            candidate.Add(special);
 
         foreach (var (presetTask, dragItem) in presetTaskBindings)
         {
@@ -976,7 +980,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
 
                     if (selectOption == null) continue;
 
-                    if (MaaProcessor.Interface?.Option?.TryGetValue(optionName, out var interfaceOption) != true) continue;
+                    if (TaskEditing.Interface()?.Option?.TryGetValue(optionName, out var interfaceOption) != true) continue;
 
                     if (interfaceOption.IsCheckbox)
                     {
@@ -1024,7 +1028,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                         var fullOption = optionValue.ToObject<MaaInterface.MaaInterfaceSelectOption>();
                         if (fullOption != null)
                         {
-                            selectOption.Index = fullOption.Index;
+                            selectOption.CopySelectionFrom(fullOption);
                             selectOption.SelectedCases = fullOption.SelectedCases;
                             selectOption.Data = fullOption.Data;
                             selectOption.SubOptions = fullOption.SubOptions;
@@ -1038,7 +1042,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                         if (caseName != null && interfaceOption.Cases != null)
                         {
                             var idx = interfaceOption.Cases.FindIndex(c => c.Name == caseName);
-                            if (idx >= 0) selectOption.Index = idx;
+                            if (idx >= 0) OptionSelection.SelectIndex(interfaceOption, selectOption, idx);
                         }
                     }
                 }
@@ -1052,50 +1056,18 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
             }
         }
 
-        var savedTaskItems = TaskItemViewModels
-            .Where(model => !model.IsResourceOptionItem)
-            .Select(model => model.InterfaceItem)
-            .ToList();
-        var currentTaskKeys = savedTaskItems
-            .Where(task => !string.IsNullOrWhiteSpace(task?.Name) && !string.IsNullOrWhiteSpace(task.Entry))
-            .Select(task => $"{task!.Name}{TaskLoader.NEW_SEPARATOR}{task.Entry}")
-            .Distinct()
-            .ToList();
-
-        Processor.InstanceConfiguration.SetValue(ConfigurationKeys.TaskItems, savedTaskItems);
-        Processor.InstanceConfiguration.SetValue(ConfigurationKeys.CurrentTasks, currentTaskKeys);
-
-        if (!string.IsNullOrWhiteSpace(preset.Name))
-            Processor.InstanceConfiguration.SetValue(ConfigurationKeys.InstancePresetKey, preset.Name);
-        else
-            Processor.InstanceConfiguration.RemoveValue(ConfigurationKeys.InstancePresetKey);
+        return candidate;
     }
 
+    /// <summary>preset 写入后重建运行时缓存；preset 没给的值不补，读取时跟随当前默认。</summary>
     private void RefreshPresetOptionRuntimeState(MaaInterface.MaaInterfaceSelectOption option)
     {
         if (string.IsNullOrWhiteSpace(option.Name)) return;
-        if (MaaProcessor.Interface?.Option?.TryGetValue(option.Name, out var interfaceOption) != true) return;
+        if (TaskEditing.Interface()?.Option?.TryGetValue(option.Name, out var interfaceOption) != true) return;
 
-        if (interfaceOption.IsInput && interfaceOption.Inputs != null)
-        {
-            option.Data ??= new Dictionary<string, string?>();
-            foreach (var input in interfaceOption.Inputs)
-            {
-                if (!string.IsNullOrWhiteSpace(input.Name) && !option.Data.ContainsKey(input.Name))
-                    option.Data[input.Name] = input.Default ?? string.Empty;
-            }
-
-            if (interfaceOption.PipelineOverride != null)
-            {
-                option.PipelineOverride = interfaceOption.GenerateProcessedPipeline(
-                    option.Data
-                        .Where(kv => kv.Value != null)
-                        .ToDictionary(kv => kv.Key, kv => kv.Value!));
-            }
-        }
-
-        if (interfaceOption.IsCheckbox)
-            option.SelectedCases ??= new List<string>(interfaceOption.DefaultCases ?? new List<string>());
+        if (interfaceOption.IsInput && interfaceOption.PipelineOverride != null)
+            option.PipelineOverride = interfaceOption.GenerateProcessedPipeline(
+                OptionValues.GetFieldValues(interfaceOption, option));
 
         if (option.SubOptions == null) return;
 
@@ -1135,7 +1107,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         if (string.Equals(currentOption.Name, targetOptionName, StringComparison.Ordinal))
             return currentOption;
 
-        if (MaaProcessor.Interface?.Option?.TryGetValue(currentOption.Name, out var currentOptionDef) != true ||
+        if (TaskEditing.Interface()?.Option?.TryGetValue(currentOption.Name, out var currentOptionDef) != true ||
             currentOptionDef.Cases == null)
             return null;
 
@@ -1156,7 +1128,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                 if (childOption == null)
                 {
                     childOption = new MaaInterface.MaaInterfaceSelectOption { Name = childOptionName };
-                    TaskLoader.SetDefaultOptionValue(MaaProcessor.Interface, childOption);
+                    TaskLoader.PrepareOption(TaskEditing.Interface(), childOption);
                     currentOption.SubOptions.Add(childOption);
                 }
 
@@ -1177,7 +1149,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         if (string.Equals(currentOptionName, targetOptionName, StringComparison.Ordinal)) return true;
         if (!visited.Add(currentOptionName)) return false;
 
-        if (MaaProcessor.Interface?.Option?.TryGetValue(currentOptionName, out var currentOptionDef) != true ||
+        if (TaskEditing.Interface()?.Option?.TryGetValue(currentOptionName, out var currentOptionDef) != true ||
             currentOptionDef.Cases == null)
             return false;
 
@@ -1199,40 +1171,78 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
     private void ResetTasks()
     {
         using var _ = BeginUiLogScope("ResetTasks");
+        if (!TryResetTaskQueue(out var preset, out var staleKey)) return;
+        UpdateTasksForResource(CurrentResource);
+        OnPropertyChanged(nameof(ResetTasksTip));
+        if (staleKey != null)
+            LoggerHelper.Info($"实例记录的预设“{staleKey}”已不在当前资源中，已按任务列表重置并清除该记录");
+        LoggerHelper.UserAction(preset == null ? "重置任务列表" : "按预设重置任务列表",
+            preset == null ? $"taskCount={TaskItemViewModels.Count}" : $"preset={preset.Name}, taskCount={TaskItemViewModels.Count}",
+            operation: "ResetTasks", instanceId: Processor.InstanceId, instanceName: InstanceName);
+    }
+
+    /// <summary>
+    /// 重置任务队列。实例记着的预设仍在当前 interface 里时，按该预设的当前版本重建并保留记录，等同重新应用一次；
+    /// 没有记录或预设已不存在时，按 interface 的任务列表重建并清除记录。
+    /// 两种情况都保留资源选项项与特殊任务，不动全局、资源、控制器选项。
+    /// </summary>
+    public bool TryResetTaskQueue(out MaaInterface.MaaInterfacePreset? preset, out string? staleKey)
+    {
+        preset = FindInstancePreset(out staleKey);
+        if (preset != null)
+            return TryApplyTaskEdit(BuildPresetCandidate(preset), resetHistory: true, setPreset: true, presetKey: preset.Name);
+
         // 保留特殊任务（倒计时、系统通知等用户手动添加的自定义 Action 任务）
         var specialTasks = TaskItemViewModels
             .Where(t => !string.IsNullOrWhiteSpace(t.InterfaceItem?.Entry)
                 && ViewModels.UsersControls.Settings.AddTaskDialogViewModel.SpecialActionNames.Contains(t.InterfaceItem.Entry!))
             .ToList();
 
-        // 清空当前任务列表
-        TaskItemViewModels.Clear();
+        var candidate = TaskItemViewModels.Where(item => item.IsResourceOptionItem).ToList();
 
         // 从 TasksSource 重新填充任务（TasksSource 包含 interface 中定义的原始任务）
-        foreach (var item in Processor.TasksSource)
+        foreach (var item in TaskEditing.Templates())
         {
             // 克隆任务以避免引用问题
             var resetItem = item.Clone();
-            resetItem.OwnerViewModel = this;
-            EnsureDefaultOptionValues(resetItem.InterfaceItem?.Option);
-            TaskItemViewModels.Add(resetItem);
+            resetItem.OwnerViewModel = null;
+            PrepareOptions(resetItem.InterfaceItem?.Option, TaskEditing.Interface());
+            candidate.Add(resetItem);
         }
 
         // 恢复特殊任务到列表末尾
         foreach (var special in specialTasks)
         {
-            special.OwnerViewModel = this;
-            EnsureDefaultOptionValues(special.InterfaceItem?.Option);
-            TaskItemViewModels.Add(special);
+            candidate.Add(special);
         }
 
-        // 更新任务的资源支持状态
-        UpdateTasksForResource(CurrentResource);
+        return TryApplyTaskEdit(candidate, resetHistory: true, setPreset: true);
+    }
 
-        // 保存配置
-        Processor.InstanceConfiguration.SetValue(ConfigurationKeys.TaskItems, TaskItemViewModels.ToList().Select(model => model.InterfaceItem));
-        LoggerHelper.UserAction("重置任务列表", $"taskCount={TaskItemViewModels.Count}",
-            operation: "ResetTasks", instanceId: Processor.InstanceId, instanceName: InstanceName);
+    /// <summary>实例记着的预设；没有记录时返回 null，记录的预设已不在当前 interface 里时由 staleKey 给出。</summary>
+    private MaaInterface.MaaInterfacePreset? FindInstancePreset(out string? staleKey)
+    {
+        staleKey = null;
+        if (!TaskEditing.Configuration().TryReadTaskState(out var state, out _)
+            || string.IsNullOrWhiteSpace(state.PresetKey))
+            return null;
+
+        var preset = TaskEditing.Interface()?.Preset?.FirstOrDefault(candidate => candidate.Name == state.PresetKey);
+        if (preset == null) staleKey = state.PresetKey;
+        return preset;
+    }
+
+    /// <summary>重置按钮提示：实例记着有效预设时写明会重置成哪个预设。</summary>
+    public string ResetTasksTip
+    {
+        get
+        {
+            var preset = FindInstancePreset(out _);
+            return preset == null
+                ? LangKeys.Reset.ToLocalization()
+                : LangKeys.ResetTasksToPreset.ToLocalizationFormatted(false,
+                    LanguageHelper.GetLocalizedDisplayName(preset.Label, preset.Name));
+        }
     }
 
     #endregion
@@ -1372,6 +1382,20 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
 
     private (long Version, AdbDeviceInfo? Target) GetAdbSelectionSnapshot() =>
         DispatcherHelper.RunOnMainThread(() => (_manualAdbSelectionVersion, _customAdbTarget));
+
+    private AdbDeviceInfo? GetPreferredAdbTarget() => DispatcherHelper.RunOnMainThread(() =>
+    {
+        if (_customAdbTarget is { } customTarget)
+            return customTarget;
+        if (CurrentDevice is AdbDeviceInfo current && !string.IsNullOrWhiteSpace(current.AdbSerial))
+            return current;
+        if (Processor.InstanceConfiguration.GetValue(ConfigurationKeys.RememberAdb, true)
+            && Processor.InstanceConfiguration.TryGetValue(ConfigurationKeys.AdbDevice, out AdbDeviceInfo saved,
+                new UniversalEnumConverter<AdbInputMethods>(), new UniversalEnumConverter<AdbScreencapMethods>())
+            && !string.IsNullOrWhiteSpace(saved.AdbSerial))
+            return saved;
+        return null;
+    });
 
     public Task ApplyCustomAdbDevice(AdbDeviceInfo device)
     {
@@ -1562,12 +1586,15 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
     partial void OnCurrentDeviceChanged(object? value)
     {
         if (!_suppressAutoConnect && !_isSyncing
-            && value is AdbDeviceInfo && _customAdbTarget != null
+            && value is AdbDeviceInfo
             && !ReferenceEquals(value, _customAdbTarget))
         {
-            // 用户主动切换设备后，后续刷新恢复通常的设备选择规则。
+            // Every explicit dropdown selection invalidates older discovery and queued UI updates.
+            // The editor already publishes its version before assigning its own target object.
             _customAdbTarget = null;
             Interlocked.Increment(ref _manualAdbSelectionVersion);
+            _refreshCancellationTokenSource?.Cancel();
+            SetAdbRecoverySelectionLock(false);
         }
         if (value is EmptyDevicePlaceholder)
         {
@@ -1737,6 +1764,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         {
             OnPropertyChanged(nameof(CurrentDevicePlaceholderText));
             OnPropertyChanged(nameof(CurrentDeviceTooltipText));
+            OnPropertyChanged(nameof(ResetTasksTip));
 
             if (Devices.Count == 1 && Devices[0] is EmptyDevicePlaceholder)
             {
@@ -1747,7 +1775,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
 
     partial void OnCurrentControllerChanged(MaaControllerTypes value)
     {
-        if (_isSyncing) return;
+        if (_isSyncing || MaaProcessor.Interface == null) return;
         if (value != MaaControllerTypes.Adb && _customAdbTarget != null)
         {
             _customAdbTarget = null;
@@ -1770,7 +1798,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         Processor.InstanceConfiguration.SetValue(ConfigurationKeys.CurrentControllerName, _savedControllerName ?? string.Empty);
         if (Instances.IsResolved<ConnectSettingsUserControlModel>())
             Instances.ConnectSettingsUserControlModel.CurrentControllerType = value;
-        UpdateResourcesForController(CurrentResource);
+        UpdateResourcesForController(CurrentResource, controllerChanged: true);
         RefreshPresets();
         if (value == MaaControllerTypes.PlayCover)
         {
@@ -1780,6 +1808,9 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         // Invalidate the old connection even when the new controller finds no device
         // or uses the same input methods. Its resource/window rules may still differ.
         _refreshCancellationTokenSource?.Cancel();
+        // The switch owns the reset. Persist changed defaults as one batch so each
+        // input/screencap property does not reset the old controller again.
+        Instances.ConnectSettingsUserControlModel.WithoutTaskerReset(() => HandleControllerSettings(value));
         Processor.SetTasker();
         _suppressAutoConnect = true;
         try
@@ -1818,18 +1849,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
 
     private MaaInterface.MaaResourceController? ResolveTargetController(MaaControllerTypes controllerType)
     {
-        if (!string.IsNullOrWhiteSpace(_savedControllerName))
-        {
-            var exactMatch = ControllerOptions.FirstOrDefault(c =>
-                !string.IsNullOrWhiteSpace(c.Name)
-                && c.Name.Equals(_savedControllerName, StringComparison.OrdinalIgnoreCase));
-            if (exactMatch != null)
-            {
-                return exactMatch;
-            }
-        }
-
-        return ControllerOptions.FirstOrDefault(c => c.ControllerType == controllerType)
+        return MaaInterfaceActivationHelper.ResolveControllerDefinition(ControllerOptions, controllerType, _savedControllerName)
             ?? ControllerOptions.FirstOrDefault();
     }
 
@@ -2164,7 +2184,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                     ? DetectWlRootsSockets()
                 : DetectDesktopWindows(controllerType);
         token.ThrowIfCancellationRequested();
-        if (!UpdateDeviceList(devices, index, selectionVersion, strictLaunchTarget))
+        if (!UpdateDeviceList(devices, index, selectionVersion, strictLaunchTarget, token))
             return;
         token.ThrowIfCancellationRequested();
         HandleControllerSettings(controllerType);
@@ -2186,7 +2206,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
             ProcessHelper.ReconnectByAdb(Processor.Config.AdbDevice.AdbPath, savedSerial);
         }
 
-        var devices = MaaProcessor.Toolkit.AdbDevice.Find();
+        var devices = MaaProcessor.Toolkit.AdbDevice.Find().ToList();
         var index = CalculateAdbDeviceIndex(devices, strictLaunchTarget);
         return (new(devices), index);
     }
@@ -2205,30 +2225,59 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
 
     private int CalculateAdbDeviceIndex(IList<AdbDeviceInfo> devices, bool strictLaunchTarget = false)
     {
-        var preferredDeviceIndex = FindPreferredAdbDeviceIndexByLaunchConfig(devices);
-        if (preferredDeviceIndex >= 0)
+        var target = GetPreferredAdbTarget();
+        var launchIndex = GetPreferredEmulatorIndexFromLaunchConfig();
+        IList<AdbDeviceInfo> candidates = devices;
+        if (strictLaunchTarget && launchIndex >= 0)
         {
-            return preferredDeviceIndex;
-        }
+            var launchedDeviceIndex = FindPreferredAdbDeviceIndexByLaunchConfig(devices);
+            if (launchedDeviceIndex >= 0)
+                return launchedDeviceIndex;
 
-        if (strictLaunchTarget && GetPreferredEmulatorIndexFromLaunchConfig() >= 0)
-        {
-            LoggerHelper.Info("启动阶段启用了严格多开匹配：当前未找到目标多开号设备，保持未选择状态。");
-            return -1;
-        }
-
-        if (CurrentDevice is AdbDeviceInfo info)
-        {
-            LogUiStateChange("MatchAdbDevice", $"当前设备指纹：{DescribeAdbDeviceInfo(info)}");
-            var matchedDevice = FindBestFingerprintMatchedAdbDevice(devices, info);
-            if (matchedDevice != null)
+            // A launch command explicitly naming another instance must never connect the old one.
+            if (target == null || !TryGetIndexFromConfig(target.Config, out var targetIndex)
+                || targetIndex != launchIndex)
             {
-                return devices.IndexOf(matchedDevice);
+                LoggerHelper.Info($"启动目标尚未出现：多开号={launchIndex}，不选择其他设备。");
+                return -1;
+            }
+
+            // Every device still reporting an instance index is another instance. Keep them out of the
+            // recovery below, and do not retain the target when one of them now answers on its address
+            // (e.g. a reused emulator port): connecting that address would reach the other instance.
+            candidates = devices.Where(device => !TryGetIndexFromConfig(device.Config, out _)).ToList();
+            if (devices.Any(device => TryGetIndexFromConfig(device.Config, out _) && IsSameAdbAddress(device, target)))
+            {
+                LoggerHelper.Info($"启动目标尚未出现：多开号={launchIndex}，已保存地址正被其他实例占用，不选择其他设备。");
+                return -1;
             }
         }
 
-        return devices.Count > 0 ? 0 : -1;
+        if (target != null)
+        {
+            var exact = candidates.FirstOrDefault(device => IsSameAdbAddress(device, target));
+            if (exact != null)
+                return devices.IndexOf(exact);
+
+            var matched = Processor.InstanceConfiguration.GetValue(ConfigurationKeys.UseFingerprintMatching, true)
+                ? FindBestFingerprintMatchedAdbDevice(candidates, target)
+                : null;
+            if (matched != null)
+                return devices.IndexOf(matched);
+
+            // Retain the remembered target even for an empty scan; do not persist an unrelated device.
+            devices.Add(target);
+            LoggerHelper.Info($"已保存 ADB 目标暂未发现，保留离线目标：{DescribeAdbDeviceInfo(target)}");
+            return devices.Count - 1;
+        }
+
+        var preferredDeviceIndex = FindPreferredAdbDeviceIndexByLaunchConfig(devices);
+        return preferredDeviceIndex >= 0 ? preferredDeviceIndex : devices.Count > 0 ? 0 : -1;
     }
+
+    private static bool IsSameAdbAddress(AdbDeviceInfo device, AdbDeviceInfo target) =>
+        string.Equals(device.AdbPath, target.AdbPath, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(device.AdbSerial, target.AdbSerial, StringComparison.OrdinalIgnoreCase);
 
     private int FindPreferredAdbDeviceIndexByLaunchConfig(IList<AdbDeviceInfo> devices)
     {
@@ -2461,14 +2510,16 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
     }
 
     private bool UpdateDeviceList(ObservableCollection<object> devices, int index, long selectionVersion,
-        bool strictLaunchTarget = false)
+        bool strictLaunchTarget = false, CancellationToken token = default)
     {
         // 使用同步方式更新设备列表，确保在 AutoDetectDevice 返回前设备已更新
         // 这对于 Win32 连接失败后重试时正确检测窗口至关重要
         //DispatcherHelper.RunOnMainThread 已经是同步的（使用 Dispatcher.UIThread.Invoke）
         return DispatcherHelper.RunOnMainThread(() =>
         {
-            if (!IsCurrentAdbSelectionVersion(selectionVersion))
+            // A newer refresh cancels this scan before starting its own. Re-check on the UI thread: this commit
+            // may have waited behind that refresh (e.g. one running synchronously on the UI thread) and is stale.
+            if (!IsCurrentAdbSelectionVersion(selectionVersion) || token.IsCancellationRequested)
                 return false;
             _suppressAutoConnect = true;
             try
@@ -2476,15 +2527,9 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                 if (CurrentController == MaaControllerTypes.Adb && strictLaunchTarget
                     && (GetPreferredEmulatorIndexFromLaunchConfig() >= 0 || _customAdbTarget != null))
                 {
-                    // 严格启动只能使用启动参数指定的目标；未指定多开号时才匹配手动目标。
+                    // Discovery already resolved the explicit launch index or remembered target,
+                    // including fingerprint recovery and retaining an offline device.
                     var selected = index >= 0 && index < devices.Count ? devices[index] as AdbDeviceInfo : null;
-                    if (GetPreferredEmulatorIndexFromLaunchConfig() < 0 && _customAdbTarget is { } savedTarget)
-                    {
-                        var discovered = devices.OfType<AdbDeviceInfo>().ToList();
-                        selected = discovered.FirstOrDefault(device =>
-                            string.Equals(device.AdbPath, savedTarget.AdbPath, StringComparison.OrdinalIgnoreCase)
-                            && string.Equals(device.AdbSerial, savedTarget.AdbSerial, StringComparison.OrdinalIgnoreCase));
-                    }
 
                     if (selected == null)
                     {
@@ -2512,7 +2557,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                         CurrentDevice = selected;
                     }
                 }
-                else if (CurrentController == MaaControllerTypes.Adb && _customAdbTarget is { } customTarget)
+                else if (CurrentController == MaaControllerTypes.Adb && GetPreferredAdbTarget() is { } customTarget)
                 {
                     var discovered = devices.OfType<AdbDeviceInfo>().ToList();
                     var exactMatch = discovered.FirstOrDefault(device =>
@@ -2521,8 +2566,10 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                     var selected = customTarget;
                     if (exactMatch != null)
                     {
-                        // 同地址仍使用手动保存的配置，避免检测结果覆盖用户编辑的参数。
-                        devices[devices.IndexOf(exactMatch)] = customTarget;
+                        if (_customAdbTarget != null)
+                            devices[devices.IndexOf(exactMatch)] = customTarget;
+                        else
+                            selected = exactMatch;
                     }
                     else
                     {
@@ -2535,7 +2582,8 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                             devices.Add(customTarget);
                     }
 
-                    _customAdbTarget = selected;
+                    if (_customAdbTarget != null)
+                        _customAdbTarget = selected;
                     Devices = devices;
                     CurrentDevice = selected;
                 }
@@ -2564,14 +2612,10 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         });
     }
 
-    private MaaInterface.MaaResourceController? GetSelectedControllerDefinition(MaaControllerTypes controllerType)
+    public MaaInterface.MaaResourceController? GetSelectedControllerDefinition(MaaControllerTypes controllerType)
     {
-        var controllerName = NormalizeControllerName(GetCurrentControllerName());
-        var controllers = MaaProcessor.Interface?.Controller;
-        return controllers?.FirstOrDefault(c => c.ControllerType == controllerType
-                && !string.IsNullOrWhiteSpace(controllerName)
-                && string.Equals(NormalizeControllerName(c.Name), controllerName, StringComparison.OrdinalIgnoreCase))
-            ?? controllers?.FirstOrDefault(c => c.ControllerType == controllerType);
+        return MaaInterfaceActivationHelper.ResolveControllerDefinition(
+            MaaProcessor.Interface?.Controller, controllerType, _savedControllerName);
     }
 
     private void HandleControllerSettings(MaaControllerTypes controllerType)
@@ -2583,7 +2627,9 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         var controllerName = NormalizeControllerName(GetCurrentControllerName());
         var controller = GetSelectedControllerDefinition(controllerType);
         var settingsKey = (controllerType, controllerName);
-        if (_lastAppliedControllerSettingsKey == settingsKey)
+        if (_lastAppliedControllerSettingsKey is { } applied
+            && applied.Type == settingsKey.controllerType
+            && string.Equals(applied.Name, settingsKey.controllerName, StringComparison.OrdinalIgnoreCase))
             return;
 
         if (controller == null) return;
@@ -2601,7 +2647,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
     }
 
     private static string? NormalizeControllerName(string? name) =>
-        string.IsNullOrWhiteSpace(name) ? null : name.Trim();
+        MaaInterfaceActivationHelper.NormalizeControllerName(name);
 
     private void HandleInputSettings(MaaInterface.MaaResourceController controller, bool isAdb)
     {
@@ -2855,69 +2901,32 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
 
     public void TryReadAdbDeviceFromConfig(bool inTask = true, bool refresh = false, bool allowAutoDetect = true, bool showToast = true, bool strictLaunchTarget = false)
     {
-        var (selectionVersion, customTarget) = GetAdbSelectionSnapshot();
+        var selectionVersion = GetAdbSelectionSnapshot().Version;
         if (CurrentController == MaaControllerTypes.PlayCover)
         {
             SetConnected(false);
             return;
         }
 
-        if (CurrentController == MaaControllerTypes.Adb && customTarget != null)
+        var preferredTarget = CurrentController == MaaControllerTypes.Adb ? GetPreferredAdbTarget() : null;
+        // With discovery disabled, a strict launch still scans to recover a remembered target whose address
+        // changed across the restart. Without one there is nothing to recover, so never pick a device.
+        if (!allowAutoDetect && (preferredTarget == null || !strictLaunchTarget))
         {
-            // 恢复流程也沿用手动目标，不能回退到无关设备或清空尚未上线的目标。
-            if (!allowAutoDetect && !strictLaunchTarget)
-                ApplyCurrentDeviceSelection(customTarget, selectionVersion);
-            else if (inTask)
-                TaskManager.RunTask(() => AutoDetectDevice(showToast: showToast,
-                    strictLaunchTarget: strictLaunchTarget, expectedAdbSelectionVersion: selectionVersion), name: "刷新设备");
-            else
-                AutoDetectDevice(showToast: showToast, strictLaunchTarget: strictLaunchTarget,
-                    expectedAdbSelectionVersion: selectionVersion);
-            return;
-        }
-
-        var rememberAdb = Processor.InstanceConfiguration.GetValue(ConfigurationKeys.RememberAdb, true);
-        var hasSavedDevice = Processor.InstanceConfiguration.TryGetValue(ConfigurationKeys.AdbDevice, out AdbDeviceInfo savedDevice1,
-            new UniversalEnumConverter<AdbInputMethods>(), new UniversalEnumConverter<AdbScreencapMethods>());
-        var shouldKeepMatchingSavedDeviceStrictly = strictLaunchTarget
-            && CurrentController == MaaControllerTypes.Adb
-            && rememberAdb
-            && Processor.Config.AdbDevice.AdbPath == "adb"
-            && hasSavedDevice;
-
-        if (!allowAutoDetect && !shouldKeepMatchingSavedDeviceStrictly)
-        {
-            if (CurrentController != MaaControllerTypes.Adb
-                || !rememberAdb
-                || !hasSavedDevice)
+            DispatcherHelper.RunOnMainThread(() =>
             {
-                DispatcherHelper.RunOnMainThread(() =>
+                if (!IsCurrentAdbSelectionVersion(selectionVersion))
+                    return;
+                _suppressAutoConnect = true;
+                try
                 {
-                    if (!IsCurrentAdbSelectionVersion(selectionVersion))
-                        return;
-                    _suppressAutoConnect = true;
-                    try
-                    {
+                    if (preferredTarget == null)
                         SetEmptyDeviceState(MaaControllerTypes.Adb);
-                    }
-                    finally
+                    else
                     {
-                        _suppressAutoConnect = false;
+                        Devices = [preferredTarget];
+                        CurrentDevice = preferredTarget;
                     }
-                });
-                return;
-            }
-
-            var savedDevice = savedDevice1;
-            DispatcherHelper.RunOnMainThread(() =>
-            {
-                if (!IsCurrentAdbSelectionVersion(selectionVersion))
-                    return;
-                _suppressAutoConnect = true;
-                try
-                {
-                    Devices = [savedDevice];
-                    CurrentDevice = savedDevice;
                 }
                 finally
                 {
@@ -2927,161 +2936,38 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
             return;
         }
 
-        if ((refresh && !shouldKeepMatchingSavedDeviceStrictly)
-            || CurrentController != MaaControllerTypes.Adb
-            || !rememberAdb
-            || Processor.Config.AdbDevice.AdbPath != "adb"
-            || !hasSavedDevice)
+        // Publish the remembered target before scheduling discovery. The startup connection
+        // queue may otherwise overtake the scan and attempt to connect an empty serial.
+        if (preferredTarget is { } rememberedTarget)
         {
-            if (!IsCurrentAdbSelectionVersion(selectionVersion))
-                return;
-            _refreshCancellationTokenSource?.Cancel();
-            _refreshCancellationTokenSource = new CancellationTokenSource();
-            var detectionToken = _refreshCancellationTokenSource.Token;
-            if (inTask)
-                TaskManager.RunTask(() => AutoDetectDevice(detectionToken, showToast, strictLaunchTarget, selectionVersion), name: "刷新设备");
-            else
-                AutoDetectDevice(detectionToken, showToast, strictLaunchTarget, selectionVersion);
-            return;
-        }
-        // 检查是否启用指纹匹配功能
-        var useFingerprintMatching = shouldKeepMatchingSavedDeviceStrictly
-            || Processor.InstanceConfiguration.GetValue(ConfigurationKeys.UseFingerprintMatching, true);
-
-        if (useFingerprintMatching)
-        {
-            // 使用指纹匹配设备，而不是直接使用保存的设备信息
-            // 因为雷电模拟器等的AdbSerial每次启动都会变化
-            LoggerHelper.Info(shouldKeepMatchingSavedDeviceStrictly
-                ? "严格匹配模式已启用，持续按已保存设备指纹匹配 ADB 设备。"
-                : "正在从配置中读取已保存的 ADB 设备，并启用指纹匹配。");
-            LoggerHelper.Info($"已保存设备的指纹：{savedDevice1.GenerateDeviceFingerprint()}");
-
-            // 搜索当前可用的设备
-            var currentDevices = MaaProcessor.Toolkit.AdbDevice.Find();
-
-            var preferredDeviceIndex = FindPreferredAdbDeviceIndexByLaunchConfig(currentDevices);
-            if (preferredDeviceIndex >= 0)
+            DispatcherHelper.RunOnMainThread(() =>
             {
-                var preferredDevice = currentDevices[preferredDeviceIndex];
-                DispatcherHelper.RunOnMainThread(() =>
-                {
-                    if (!IsCurrentAdbSelectionVersion(selectionVersion))
-                        return;
-                    _suppressAutoConnect = true;
-                    try
-                    {
-                        SetAdbRecoverySelectionLock(false);
-                        Devices = new ObservableCollection<object>(currentDevices);
-                    }
-                    finally
-                    {
-                        _suppressAutoConnect = false;
-                    }
-                });
-                ApplyCurrentDeviceSelection(preferredDevice, selectionVersion);
-                return;
-            }
-
-            if (strictLaunchTarget && GetPreferredEmulatorIndexFromLaunchConfig() >= 0)
-            {
-                LoggerHelper.Info("启动阶段启用了严格多开匹配：目标多开号设备尚未出现，本次不回退到历史设备。");
-                DispatcherHelper.RunOnMainThread(() =>
-                {
-                    if (!IsCurrentAdbSelectionVersion(selectionVersion))
-                        return;
-                    _suppressAutoConnect = true;
-                    try
-                    {
-                        ClearActiveAdbDeviceConfig();
-                    }
-                    finally
-                    {
-                        _suppressAutoConnect = false;
-                    }
-                });
-                return;
-            }
-
-            // 尝试通过指纹匹配找到对应的设备（当任一方index为-1时不比较index）
-            var matchedDevice = FindBestFingerprintMatchedAdbDevice(currentDevices, savedDevice1);
-
-            if (matchedDevice != null)
-            {
-                LoggerHelper.Info($"已通过指纹匹配到设备：名称={matchedDevice.Name}，ADB 序列号={matchedDevice.AdbSerial}");
-                // 使用新搜索到的设备信息（AdbSerial等可能已更新）
-                DispatcherHelper.RunOnMainThread(() =>
-                {
-                    if (!IsCurrentAdbSelectionVersion(selectionVersion))
-                        return;
-                    _suppressAutoConnect = true;
-                    try
-                    {
-                        SetAdbRecoverySelectionLock(false);
-                        Devices = new ObservableCollection<object>(currentDevices);
-                    }
-                    finally
-                    {
-                        _suppressAutoConnect = false;
-                    }
-                });
-                ApplyCurrentDeviceSelection(matchedDevice, selectionVersion);
-            }
-            else
-            {
-                if (shouldKeepMatchingSavedDeviceStrictly)
-                {
-                    LoggerHelper.Info("严格匹配模式下暂未匹配到已保存设备，保留等待并继续按指纹匹配。");
-                    DispatcherHelper.RunOnMainThread(() =>
-                    {
-                        if (!IsCurrentAdbSelectionVersion(selectionVersion))
-                            return;
-                        _suppressAutoConnect = true;
-                        try
-                        {
-                            ClearActiveAdbDeviceConfig();
-                        }
-                        finally
-                        {
-                            _suppressAutoConnect = false;
-                        }
-                    });
+                if (!IsCurrentAdbSelectionVersion(selectionVersion) || CurrentDevice != null)
                     return;
+                _suppressAutoConnect = true;
+                try
+                {
+                    Devices = [rememberedTarget];
+                    CurrentDevice = rememberedTarget;
                 }
-
-                // 没有找到匹配的设备，执行自动检测
-                LoggerHelper.Info("未通过指纹匹配到设备，开始自动检测。");
-                if (!IsCurrentAdbSelectionVersion(selectionVersion))
-                    return;
-                _refreshCancellationTokenSource?.Cancel();
-                _refreshCancellationTokenSource = new CancellationTokenSource();
-                var detectionToken = _refreshCancellationTokenSource.Token;
-                if (inTask)
-                    TaskManager.RunTask(() => AutoDetectDevice(detectionToken, true, strictLaunchTarget, selectionVersion), name: "刷新设备");
-                else
-                    AutoDetectDevice(detectionToken, true, strictLaunchTarget, selectionVersion);
-            }
+                finally
+                {
+                    _suppressAutoConnect = false;
+                }
+            });
         }
+
+        // Startup, recovery and ordinary refresh all use the same target selection policy.
+        if (!IsCurrentAdbSelectionVersion(selectionVersion))
+            return;
+        _refreshCancellationTokenSource?.Cancel();
+        _refreshCancellationTokenSource = new CancellationTokenSource();
+        var detectionToken = _refreshCancellationTokenSource.Token;
+        if (inTask)
+            TaskManager.RunTask(() => AutoDetectDevice(detectionToken, showToast, strictLaunchTarget, selectionVersion),
+                detectionToken, name: "刷新设备");
         else
-        {
-            // 不使用指纹匹配，直接使用保存的设备信息
-            LoggerHelper.Info("正在从配置中读取已保存的 ADB 设备，当前未启用指纹匹配。");
-            DispatcherHelper.RunOnMainThread(() =>
-            {
-                if (!IsCurrentAdbSelectionVersion(selectionVersion))
-                    return;
-                _suppressAutoConnect = true;
-                try
-                {
-                    Devices = [savedDevice1];
-                    CurrentDevice = savedDevice1;
-                }
-                finally
-                {
-                    _suppressAutoConnect = false;
-                }
-            });
-        }
+            AutoDetectDevice(detectionToken, showToast, strictLaunchTarget, selectionVersion);
     }
 
     #endregion
@@ -3091,6 +2977,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private ObservableCollection<MaaInterface.MaaInterfaceResource> _currentResources = [];
     private string _currentResource = string.Empty;
     private bool _isRefreshingResourceSelection;
+    private bool _isChangingControllerResource;
     private string? _pendingResourceSelection;
 
     public string CurrentResource
@@ -3120,7 +3007,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                 return;
             }
 
-            if (!string.IsNullOrWhiteSpace(value))
+            if (!string.IsNullOrWhiteSpace(value) && !_isChangingControllerResource)
             {
                 // SetTasker 内部会同步等待旧 Tasker 停止，移到后台线程避免阻塞 UI
                 ResetTaskerInBackground();
@@ -3155,50 +3042,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
             instanceConfig.SetValue(ConfigurationKeys.Resource, CurrentResource);
         }
 
-        instanceConfig.SetValue(
-            ConfigurationKeys.TaskItems,
-            TaskItemViewModels
-                .Where(m => !m.IsResourceOptionItem)
-                .Select(m => m.InterfaceItem)
-                .ToList());
-
-        PersistResourceOptionConfiguration(instanceConfig);
-    }
-
-    private void PersistResourceOptionConfiguration(InstanceConfiguration instanceConfig)
-    {
-        var allItems = TaskItemViewModels
-            .Where(m => m.IsResourceOptionItem && m.ResourceItem?.SelectOptions != null)
-            .ToList();
-
-        var globalItem = allItems.FirstOrDefault(m => m.ResourceItem?.Name == "__GlobalOption__");
-        if (globalItem?.ResourceItem?.SelectOptions != null)
-        {
-            instanceConfig.SetValue(
-                ConfigurationKeys.GlobalOptionItems,
-                globalItem.ResourceItem.SelectOptions);
-        }
-
-        const string controllerPrefix = "__ControllerOption__";
-        var controllerOptionItems = allItems
-            .Where(m => m.ResourceItem?.Name?.StartsWith(controllerPrefix) == true)
-            .ToDictionary(
-                m => m.ResourceItem!.Name![controllerPrefix.Length..],
-                m => m.ResourceItem!.SelectOptions!);
-        if (controllerOptionItems.Count > 0)
-        {
-            instanceConfig.SetValue(
-                ConfigurationKeys.ControllerOptionItems,
-                controllerOptionItems);
-        }
-
-        var resourceOptionItems = allItems
-            .Where(m => m.ResourceItem?.Name != "__GlobalOption__" &&
-                        m.ResourceItem?.Name?.StartsWith(controllerPrefix) != true)
-            .ToDictionary(
-                m => m.ResourceItem!.Name ?? string.Empty,
-                m => m.ResourceItem!.SelectOptions!);
-        instanceConfig.SetValue(ConfigurationKeys.ResourceOptionItems, resourceOptionItems);
+        TrySaveTaskItems();
     }
 
     /// <summary>
@@ -3370,8 +3214,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         }
 
         // 获取当前控制器对象
-        var controllerObj = MaaProcessor.Interface?.Controller?.FirstOrDefault(c =>
-            c.Name != null && c.Name.Equals(currentControllerName, StringComparison.OrdinalIgnoreCase));
+        var controllerObj = GetSelectedControllerDefinition(CurrentController);
         if (controllerObj == null) return;
 
         // 确保控制器的 SelectOptions 已初始化
@@ -3442,7 +3285,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
         {
             if (existingDict.TryGetValue(optionName, out var existing))
             {
-                TaskLoader.SetDefaultOptionValue(MaaProcessor.Interface, existing);
+                TaskLoader.PrepareOption(MaaProcessor.Interface, existing);
                 return existing;
             }
             if (savedDict?.TryGetValue(optionName, out var saved) == true)
@@ -3450,15 +3293,16 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                 var savedOption = new MaaInterface.MaaInterfaceSelectOption
                 {
                     Name = saved.Name,
-                    Index = saved.Index,
                     SelectedCases = saved.SelectedCases != null ? new List<string>(saved.SelectedCases) : null,
+                    SubOptions = saved.SubOptions != null ? CloneSubOptions(saved.SubOptions) : null,
                 };
+                savedOption.CopySelectionFrom(saved);
                 savedOption.CopyInputDataFrom(saved);
-                TaskLoader.SetDefaultOptionValue(MaaProcessor.Interface, savedOption);
+                TaskLoader.PrepareOption(MaaProcessor.Interface, savedOption);
                 return savedOption;
             }
             var opt = new MaaInterface.MaaInterfaceSelectOption { Name = optionName };
-            TaskLoader.SetDefaultOptionValue(MaaProcessor.Interface, opt);
+            TaskLoader.PrepareOption(MaaProcessor.Interface, opt);
             return opt;
         }).ToList();
     }
@@ -3521,6 +3365,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                 // 优先使用已有的值（保留运行时的修改）
                 if (existingDict.TryGetValue(optionName, out var existingOpt))
                 {
+                    TaskLoader.PrepareOption(MaaProcessor.Interface, existingOpt);
                     return existingOpt;
                 }
 
@@ -3531,20 +3376,21 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                     var clonedOpt = new MaaInterface.MaaInterfaceSelectOption
                     {
                         Name = savedOpt.Name,
-                        Index = savedOpt.Index,
                         SubOptions = savedOpt.SubOptions != null ? CloneSubOptions(savedOpt.SubOptions) : null,
                         SelectedCases = savedOpt.SelectedCases != null ? new List<string>(savedOpt.SelectedCases) : null,
                     };
+                    clonedOpt.CopySelectionFrom(savedOpt);
                     clonedOpt.CopyInputDataFrom(savedOpt);
+                    TaskLoader.PrepareOption(MaaProcessor.Interface, clonedOpt);
                     return clonedOpt;
                 }
 
-                // 最后创建新的并设置默认值
+                // 最后创建新的，只带名字，取值跟随当前默认
                 var selectOption = new MaaInterface.MaaInterfaceSelectOption
                 {
                     Name = optionName
                 };
-                TaskLoader.SetDefaultOptionValue(MaaProcessor.Interface, selectOption);
+                TaskLoader.PrepareOption(MaaProcessor.Interface, selectOption);
                 return selectOption;
             }).ToList();
     }
@@ -3559,10 +3405,10 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
             var clone = new MaaInterface.MaaInterfaceSelectOption
             {
                 Name = opt.Name,
-                Index = opt.Index,
                 SubOptions = opt.SubOptions != null ? CloneSubOptions(opt.SubOptions) : null,
                 SelectedCases = opt.SelectedCases != null ? new List<string>(opt.SelectedCases) : null
             };
+            clone.CopySelectionFrom(opt);
             clone.CopyInputDataFrom(opt);
             return clone;
         }).ToList();
@@ -3589,6 +3435,8 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
     private readonly System.Timers.Timer _liveViewTimer;
     private int _liveViewTickInProgress;
     private int _isDisposed;
+    private const int LiveViewNoImageFailureThreshold = 5;
+    private int _liveViewNoImageFailureCount;
     private bool _liveViewNoImageLogged;
 
     private void UpdateLiveViewTimerInterval()
@@ -3637,7 +3485,11 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
                 });
             }
             if (!IsLiveViewExpanded)
+            {
+                _liveViewNoImageFailureCount = 0;
+                _liveViewNoImageLogged = false;
                 return;
+            }
             if (EnableLiveView && IsConnected)
             {
                 // 流水线：非阻塞提交下一帧截图；仅当上一帧已完成时，才在提交下一帧之前读取其缓存。
@@ -3669,23 +3521,30 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
 
                 if (result.Frame != null)
                 {
+                    _liveViewNoImageFailureCount = 0;
                     _liveViewNoImageLogged = false;
                     _ = UpdateLiveViewImageAsync(result.Frame);
                 }
-                else if (result.NoImage && !_liveViewNoImageLogged)
+                else if (result.NoImage)
                 {
-                    _liveViewNoImageLogged = true;
-                    var screencapType = Processor.ScreenshotType();
-                    var controllerType = CurrentController;
-                    var reason = controllerType == MaaControllerTypes.Adb
-                        ? LangKeys.LiveViewNoImageReasonAdb.ToLocalization()
-                        : LangKeys.LiveViewNoImageReasonWindow.ToLocalization();
-                    LoggerHelper.Warning($"实时画面为空：截图方式={screencapType}，控制器={controllerType}，原因={reason}");
-                    AddLog($"warn: {LangKeys.LiveViewNoImageWarning.ToLocalizationFormatted(false, screencapType, reason)}", (IBrush?)null);
+                    if (!_liveViewNoImageLogged
+                        && ++_liveViewNoImageFailureCount >= LiveViewNoImageFailureThreshold)
+                    {
+                        _liveViewNoImageLogged = true;
+                        var screencapType = Processor.ScreenshotType();
+                        var controllerType = CurrentController;
+                        var reason = controllerType == MaaControllerTypes.Adb
+                            ? LangKeys.LiveViewNoImageReasonAdb.ToLocalization()
+                            : LangKeys.LiveViewNoImageReasonWindow.ToLocalization();
+                        LoggerHelper.Warning($"实时画面为空：截图方式={screencapType}，控制器={controllerType}，原因={reason}");
+                        AddLog($"warn: {LangKeys.LiveViewNoImageWarning.ToLocalizationFormatted(false, screencapType, reason)}", (IBrush?)null);
+                    }
                 }
             }
             else
             {
+                _liveViewNoImageFailureCount = 0;
+                _liveViewNoImageLogged = false;
                 _ = UpdateLiveViewImageAsync(null);
             }
         }
@@ -3765,6 +3624,7 @@ public partial class TaskQueueViewModel : ViewModelBase, IDisposable
     partial void OnIsConnectedChanged(bool value)
     {
         OnPropertyChanged(nameof(IsLiveViewVisible));
+        _liveViewNoImageFailureCount = 0;
         _liveViewNoImageLogged = false;
         LoggerHelper.Info(value ? "连接状态变更：已连接。" : "连接状态变更：未连接。");
     }
